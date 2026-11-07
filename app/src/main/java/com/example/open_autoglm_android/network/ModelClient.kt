@@ -179,7 +179,7 @@ class ModelClient(
         quality: Int = 80
     ): ChatMessage {
         val userContent = mutableListOf<ContentItem>()
-        val screenInfoJson = buildScreenInfo(currentApp)
+        val screenInfoJson = buildScreenInfo(currentApp, screenshot)
         val fullText = if (text.isEmpty()) screenInfoJson else "$text\n\n$screenInfoJson"
 
         // 多模态消息格式：先添加图片，再添加文本
@@ -248,9 +248,14 @@ class ModelClient(
     /**
      * 构建屏幕信息（使用 JsonObject 确保转义安全）
      */
-    private fun buildScreenInfo(currentApp: String?): String {
+    private fun buildScreenInfo(currentApp: String?, screenshot: Bitmap?): String {
         val json = JsonObject()
         json.addProperty("current_app", currentApp ?: "Unknown")
+        if (screenshot != null) {
+            json.addProperty("image_width", screenshot.width)
+            json.addProperty("image_height", screenshot.height)
+        }
+        json.addProperty("coordinate_max", 1000)
         return json.toString()
     }
     

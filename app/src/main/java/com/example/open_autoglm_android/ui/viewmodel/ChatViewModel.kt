@@ -13,6 +13,7 @@ import com.example.open_autoglm_android.data.database.ModelConfigRepository
 import com.example.open_autoglm_android.data.database.SavedChatMessage
 import com.example.open_autoglm_android.domain.ActionExecutor
 import com.example.open_autoglm_android.domain.AppRegistry
+import com.example.open_autoglm_android.domain.CoordinateSpace
 import com.example.open_autoglm_android.domain.ExecuteResult
 import com.example.open_autoglm_android.network.ModelClient
 import com.example.open_autoglm_android.network.dto.ChatMessage as NetworkChatMessage
@@ -620,16 +621,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 // 如果是 JSON 解析/格式错误，给模型一条明确的反馈消息
                 val parseError = result.message?.contains("无法从响应中提取有效的 JSON 动作") == true
-                if (parseError) {
-                    val feedbackText = buildString {
-                        appendLine("上一步你的输出格式错误，无法解析为合法的动作指令。")
-                        appendLine("请严格按照系统提示中的格式，仅输出以下两种之一：")
-                        appendLine("1) do(action=\"...\", ...)")
-                        appendLine("2) finish(message=\"...\")")
-                        appendLine("不要输出列表、自然语言说明或其他非规范格式。")
-                        appendLine()
-                        append("你上一次的输出是：")
-                        append(response.action.take(200))
+                val coordinateFeedback = result.message?.let { message ->
+                    message.startsWith(CoordinateSpace.OUT_OF_RANGE_PREFIX) ||
+                        message.startsWith(CoordinateSpace.REPEAT_PREFIX)
+                } == true
+                if (parseError || coordinateFeedback) {
+                    val feedbackText = if (coordinateFeedback) {
+                        result.message ?: ""
+                    } else {
+                        buildString {
+                            appendLine("上一步你的输出格式错误，无法解析为合法的动作指令。")
+                            appendLine("请严格按照系统提示中的格式，仅输出以下两种之一：")
+                            appendLine("1) do(action=\"...\", ...)")
+                            appendLine("2) finish(message=\"...\")")
+                            appendLine("不要输出列表、自然语言说明或其他非规范格式。")
+                            appendLine()
+                            append("你上一次的输出是：")
+                            append(response.action.take(200))
+                        }
                     }
                     messageContext.add(
                         NetworkChatMessage(
