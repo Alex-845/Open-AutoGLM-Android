@@ -390,21 +390,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             
             // 截图：如果当前在本应用前台，跳过截图发送以保护隐私
             val screenshotStartTime = System.currentTimeMillis()
-            val screenshot = if (isAutoGLMForeground) {
+            val captured = if (isAutoGLMForeground) {
                 Log.d("ChatViewModel", "当前在本应用前台，跳过截图以保护隐私")
                 null
             } else {
-                accessibilityService.takeScreenshotSuspend()
+                accessibilityService.captureForModel()
             }
+            val screenshot = captured?.bitmap
             val screenshotDuration = System.currentTimeMillis() - screenshotStartTime
             
             if (screenshot == null && !isAutoGLMForeground) {
-                val androidVersion = android.os.Build.VERSION.SDK_INT
-                val errorMessage = if (androidVersion < android.os.Build.VERSION_CODES.R) {
-                    "无法获取屏幕截图：需要 Android 11 (API 30) 及以上版本，当前版本: Android ${android.os.Build.VERSION.RELEASE} (API $androidVersion)"
-                } else {
-                    "无法获取屏幕截图，请确保无障碍服务已启用并授予截图权限。如果已启用，请尝试重启应用。"
-                }
+                val errorMessage = captured?.failureMessage
+                    ?: "无法获取屏幕截图，请重试任务。"
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     error = errorMessage
