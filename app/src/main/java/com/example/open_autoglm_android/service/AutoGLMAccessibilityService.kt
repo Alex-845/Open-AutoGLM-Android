@@ -3,6 +3,8 @@ package com.example.open_autoglm_android.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
+import android.view.accessibility.AccessibilityManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -54,6 +56,20 @@ class AutoGLMAccessibilityService : AccessibilityService() {
         fun getInstance(): AutoGLMAccessibilityService? = instance
         
         fun isServiceEnabled(): Boolean = instance != null
+
+        suspend fun awaitConnectedInstance(
+            attempts: Int = 8,
+            pauseMs: Long = 250
+        ): AutoGLMAccessibilityService? {
+            repeat(attempts) { attempt ->
+                val current = instance
+                val connected = current?.serviceInfo != null
+                Log.i(TAG, "await connection attempt=$attempt instance=${current != null} serviceInfo=$connected")
+                if (current != null && connected) return current
+                delay(pauseMs)
+            }
+            return null
+        }
     }
     
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -89,9 +105,14 @@ class AutoGLMAccessibilityService : AccessibilityService() {
         }
     }
     
+    override fun onUnbind(intent: Intent?): Boolean {
+        if (instance === this) instance = null
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
+        if (instance === this) instance = null
         super.onDestroy()
-        instance = null
         mainHandler.removeCallbacksAndMessages(null)
     }
     
@@ -122,7 +143,31 @@ class AutoGLMAccessibilityService : AccessibilityService() {
                 )
             )
         }
-        logScreenshotCapability()
+        val live = awaitConnectedInstance()
+        if (live == null) {
+            logScreenshotCapability()
+            return ScreenCapture(null, ScreenshotCapturePlan.connectionMissingMessage())
+        }
+        if (live !== this) return live.captureForModel()
+        val capability = readCapability()
+        Log.i(TAG, ScreenshotCapturePlan.formatCapabilityLog(capability))
+        when (ScreenshotCapturePlan.preCapture(capability)) {
+            ScreenshotCapturePlan.PreCapture.CAPABILITY_ABSENT -> {
+                return ScreenCapture(
+                    null,
+                    ScreenshotCapturePlan.screenshotCapabilityAbsentMessage(
+                        capability.enabledCapabilities ?: capability.inProcessCapabilities,
+                        ScreenshotCapturePlan.packageFilterBlocksAllApps(
+                            capability.enabledPackages ?: capability.inProcessPackages
+                        )
+                    )
+                )
+            }
+            ScreenshotCapturePlan.PreCapture.WAIT_FOR_CONNECTION -> {
+                return ScreenCapture(null, ScreenshotCapturePlan.connectionMissingMessage())
+            }
+            ScreenshotCapturePlan.PreCapture.PROCEED -> Unit
+        }
         val overlay = FloatingWindowService.getInstance()
         var detached = false
         try {
@@ -192,13 +237,48 @@ class AutoGLMAccessibilityService : AccessibilityService() {
 
     private fun logScreenshotCapability() {
         try {
-            val caps = serviceInfo?.capabilities ?: 0
-            val canTakeScreenshot =
-                (caps and AccessibilityServiceInfo.CAPABILITY_CAN_TAKE_SCREENSHOT) != 0
-            Log.i(TAG, "sdk=${Build.VERSION.SDK_INT} capabilities=$caps canTakeScreenshot=$canTakeScreenshot")
+            Log.i(TAG, ScreenshotCapturePlan.formatCapabilityLog(readCapability()))
         } catch (t: RuntimeException) {
-            Log.w(TAG, "serviceInfo unavailable: ${t.message}")
+            Log.w(TAG, "capability read failed ${t.javaClass.simpleName}: ${t.message}")
         }
+    }
+
+    private fun readCapability(): ScreenshotCapturePlan.CapabilityRead {
+        val info = try {
+            serviceInfo
+        } catch (t: RuntimeException) {
+            Log.w(TAG, "getServiceInfo failed ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+        val enabled = readEnabledRecord()
+        return ScreenshotCapturePlan.CapabilityRead(
+            sdk = Build.VERSION.SDK_INT,
+            inProcessInfoPresent = info != null,
+            inProcessCapabilities = info?.capabilities,
+            inProcessFlags = info?.flags,
+            inProcessEventTypes = info?.eventTypes,
+            inProcessPackages = info?.packageNames?.toList(),
+            inProcessCanTakeScreenshot = info?.let { canTakeScreenshot(it.capabilities) },
+            enabledPresent = enabled != null,
+            enabledCapabilities = enabled?.capabilities,
+            enabledFlags = enabled?.flags,
+            enabledPackages = enabled?.packageNames?.toList(),
+            enabledCanTakeScreenshot = enabled?.let { canTakeScreenshot(it.capabilities) }
+        )
+    }
+
+    private fun readEnabledRecord(): AccessibilityServiceInfo? {
+        val manager = getSystemService(AccessibilityManager::class.java) ?: return null
+        val componentName = AutoGLMAccessibilityService::class.java.name
+        return manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .firstOrNull { info ->
+                val service = info.resolveInfo?.serviceInfo ?: return@firstOrNull false
+                service.packageName == packageName && service.name == componentName
+            }
+    }
+
+    private fun canTakeScreenshot(capabilities: Int): Boolean {
+        return (capabilities and AccessibilityServiceInfo.CAPABILITY_CAN_TAKE_SCREENSHOT) != 0
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
@@ -206,9 +286,14 @@ class AutoGLMAccessibilityService : AccessibilityService() {
         val list = try {
             windows
         } catch (t: RuntimeException) {
-            Log.w(TAG, "windows unavailable: ${t.message}")
+            Log.w(TAG, "windows=error ${t.javaClass.simpleName}: ${t.message}")
             null
-        } ?: return null
+        }
+        if (list == null) {
+            Log.w(TAG, "windows=null")
+            return null
+        }
+        Log.i(TAG, "windows=${list.size}")
         val candidates = ArrayList<ScreenshotCapturePlan.WindowCandidate>(list.size)
         try {
             for (window in list) {

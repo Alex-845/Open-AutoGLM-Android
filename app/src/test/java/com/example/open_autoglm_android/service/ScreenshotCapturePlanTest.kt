@@ -244,6 +244,99 @@ class ScreenshotCapturePlanTest {
     }
 
     @Test
+    fun blankPackageNames_blocksEveryAppWhileNullDoesNot() {
+        assertTrue(ScreenshotCapturePlan.packageFilterBlocksAllApps(listOf("")))
+        assertFalse(ScreenshotCapturePlan.packageFilterBlocksAllApps(null))
+        assertFalse(ScreenshotCapturePlan.packageFilterBlocksAllApps(emptyList()))
+        assertFalse(
+            ScreenshotCapturePlan.packageFilterBlocksAllApps(
+                listOf("com.sec.android.app.popupcalculator")
+            )
+        )
+    }
+
+    @Test
+    fun capabilityLog_nullServiceInfoIsNotReportedAsZero() {
+        val line = ScreenshotCapturePlan.formatCapabilityLog(
+            ScreenshotCapturePlan.CapabilityRead(
+                sdk = 36,
+                inProcessInfoPresent = false,
+                enabledPresent = true,
+                enabledCapabilities = 159,
+                enabledFlags = 67,
+                enabledPackages = listOf(""),
+                enabledCanTakeScreenshot = true
+            )
+        )
+        assertTrue(line.contains("serviceInfo=null"))
+        assertTrue(line.contains("inProcessConnection=false"))
+        assertTrue(line.contains("enabledCapabilities=159"))
+        assertTrue(line.contains("canTakeScreenshotEnabled=true"))
+        assertFalse(line.contains("capabilities=0"))
+        assertEquals(
+            ScreenshotCapturePlan.PreCapture.WAIT_FOR_CONNECTION,
+            ScreenshotCapturePlan.preCapture(
+                ScreenshotCapturePlan.CapabilityRead(
+                    sdk = 36,
+                    inProcessInfoPresent = false,
+                    enabledPresent = true,
+                    enabledCapabilities = 159,
+                    enabledCanTakeScreenshot = true
+                )
+            )
+        )
+    }
+
+    @Test
+    fun capabilityLog_realZeroIsDistinctFromMissingInfo() {
+        val read = ScreenshotCapturePlan.CapabilityRead(
+            sdk = 36,
+            inProcessInfoPresent = true,
+            inProcessCapabilities = 0,
+            inProcessFlags = 0,
+            inProcessEventTypes = 0,
+            inProcessPackages = listOf(""),
+            inProcessCanTakeScreenshot = false,
+            enabledPresent = true,
+            enabledCapabilities = 0,
+            enabledFlags = 0,
+            enabledPackages = listOf(""),
+            enabledCanTakeScreenshot = false
+        )
+        val line = ScreenshotCapturePlan.formatCapabilityLog(read)
+        assertTrue(line.contains("serviceInfo=present"))
+        assertTrue(line.contains("inProcessCapabilities=0"))
+        assertTrue(line.contains("canTakeScreenshotInProcess=false"))
+        assertTrue(line.contains("packageFilterBlocksAllApps=true"))
+        assertEquals(ScreenshotCapturePlan.PreCapture.CAPABILITY_ABSENT, ScreenshotCapturePlan.preCapture(read))
+        val message = ScreenshotCapturePlan.screenshotCapabilityAbsentMessage(0, true)
+        assertTrue(message.contains("能力位为 0"))
+        assertTrue(message.contains("packageNames"))
+        assertFalse(message.contains("错误码 1"))
+    }
+
+    @Test
+    fun grantedEnabledCapability_proceedsEvenIfInProcessMaskIsZero() {
+        val read = ScreenshotCapturePlan.CapabilityRead(
+            sdk = 36,
+            inProcessInfoPresent = true,
+            inProcessCapabilities = 0,
+            inProcessCanTakeScreenshot = false,
+            enabledPresent = true,
+            enabledCapabilities = 128,
+            enabledCanTakeScreenshot = true
+        )
+        assertEquals(ScreenshotCapturePlan.PreCapture.PROCEED, ScreenshotCapturePlan.preCapture(read))
+    }
+
+    @Test
+    fun connectionMissingMessage_doesNotUseInternalErrorCode() {
+        val message = ScreenshotCapturePlan.connectionMissingMessage()
+        assertTrue(message.contains("连接不存在"))
+        assertFalse(message.contains("错误码 1"))
+    }
+
+    @Test
     fun belowAndroid11Message_namesCurrentApi() {
         val message = ScreenshotCapturePlan.belowAndroid11Message("10", 29)
         assertTrue(message.contains("API 29"))

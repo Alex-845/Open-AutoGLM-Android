@@ -160,4 +160,77 @@ internal object ScreenshotCapturePlan {
         val detailSuffix = detail?.takeIf { it.isNotBlank() }?.let { " $it" }.orEmpty()
         return "无法获取屏幕截图：$reason（错误码 $platformCode）$detailSuffix。请重试任务。"
     }
+
+    /**
+     * A present but blank packageNames list matches no real package.
+     * Null or an empty list means the service receives events from all packages.
+     */
+    fun packageFilterBlocksAllApps(packageNames: List<String>?): Boolean {
+        if (packageNames.isNullOrEmpty()) return false
+        return packageNames.all { it.isBlank() }
+    }
+
+    data class CapabilityRead(
+        val sdk: Int,
+        val inProcessInfoPresent: Boolean,
+        val inProcessCapabilities: Int? = null,
+        val inProcessFlags: Int? = null,
+        val inProcessEventTypes: Int? = null,
+        val inProcessPackages: List<String>? = null,
+        val inProcessCanTakeScreenshot: Boolean? = null,
+        val enabledPresent: Boolean,
+        val enabledCapabilities: Int? = null,
+        val enabledFlags: Int? = null,
+        val enabledPackages: List<String>? = null,
+        val enabledCanTakeScreenshot: Boolean? = null
+    )
+
+    enum class PreCapture {
+        PROCEED,
+        WAIT_FOR_CONNECTION,
+        CAPABILITY_ABSENT
+    }
+
+    fun preCapture(read: CapabilityRead): PreCapture {
+        if (!read.inProcessInfoPresent) return PreCapture.WAIT_FOR_CONNECTION
+        val granted = read.inProcessCanTakeScreenshot == true || read.enabledCanTakeScreenshot == true
+        if (!granted) return PreCapture.CAPABILITY_ABSENT
+        return PreCapture.PROCEED
+    }
+
+    fun formatCapabilityLog(read: CapabilityRead): String {
+        return buildString {
+            append("sdk=${read.sdk}")
+            if (!read.inProcessInfoPresent) {
+                append(" serviceInfo=null inProcessConnection=false")
+            } else {
+                append(" serviceInfo=present")
+                append(" inProcessCapabilities=${read.inProcessCapabilities}")
+                append(" inProcessFlags=${read.inProcessFlags}")
+                append(" inProcessEventTypes=${read.inProcessEventTypes}")
+                append(" inProcessPackages=${read.inProcessPackages}")
+                append(" canTakeScreenshotInProcess=${read.inProcessCanTakeScreenshot}")
+            }
+            append(" enabledPresent=${read.enabledPresent}")
+            append(" enabledCapabilities=${read.enabledCapabilities}")
+            append(" enabledFlags=${read.enabledFlags}")
+            append(" enabledPackages=${read.enabledPackages}")
+            append(" canTakeScreenshotEnabled=${read.enabledCanTakeScreenshot}")
+            append(" packageFilterBlocksAllApps=${packageFilterBlocksAllApps(read.enabledPackages ?: read.inProcessPackages)}")
+        }
+    }
+
+    fun connectionMissingMessage(): String {
+        return "无法获取屏幕截图：应用进程内的无障碍连接不存在，capabilities 未被读取。请在系统无障碍设置中关闭并重新打开 Open-AutoGLM Diag，保留应用数据，然后重试任务。"
+    }
+
+    fun screenshotCapabilityAbsentMessage(enabledCapabilities: Int?, packageFilterBlocksAllApps: Boolean): String {
+        val filter = if (packageFilterBlocksAllApps) {
+            " 服务配置的 packageNames 为空字符串，事件不会发给任何应用。"
+        } else {
+            ""
+        }
+        val caps = enabledCapabilities?.toString() ?: "未知"
+        return "无法获取屏幕截图：系统启用记录中的能力位为 $caps，不包含截图能力。安装包已声明 canTakeScreenshot。$filter 请在系统无障碍设置中关闭并重新打开 Open-AutoGLM Diag，保留应用数据，让系统重新读取服务配置后再试。"
+    }
 }

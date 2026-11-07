@@ -346,9 +346,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
     
     private suspend fun executeTaskLoop(userPrompt: String, modelName: String) {
-        val accessibilityService = AutoGLMAccessibilityService.getInstance() ?: return
+        var accessibilityService = AutoGLMAccessibilityService.getInstance() ?: return
         val client = modelClient ?: return
-        val executor = actionExecutor ?: return
+        var executor = actionExecutor ?: return
         
         var stepCount = 0
         val maxSteps = 50
@@ -369,6 +369,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             Log.d("ChatViewModel", "执行步骤 $stepCount")
+            val liveService = AutoGLMAccessibilityService.awaitConnectedInstance()
+            if (liveService == null) {
+                val message = com.example.open_autoglm_android.service.ScreenshotCapturePlan.connectionMissingMessage()
+                FloatingWindowService.getInstance()?.updateStatus("已停止", stepCount, message)
+                _uiState.value = _uiState.value.copy(isLoading = false, error = message)
+                return
+            }
+            if (liveService !== accessibilityService) {
+                accessibilityService = liveService
+                actionExecutor = ActionExecutor(liveService)
+                executor = actionExecutor ?: executor
+            }
             
             // 更新悬浮窗状态
             FloatingWindowService.getInstance()?.updateStatus("执行中", stepCount, "正在检测当前状态...")
