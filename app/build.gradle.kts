@@ -15,8 +15,8 @@ android {
         applicationId = "com.example.open_autoglm_android"
         minSdk = 24
         targetSdk = 36
-        versionCode = 103
-        versionName = "1.0.3"
+        versionCode = 106
+        versionName = "1.0.6"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -59,6 +59,15 @@ android {
             if (signingConfigs.findByName("release")?.storeFile?.exists() == true) {
                 signingConfig = signingConfigs.getByName("release")
             }
+        }
+        // Side-by-side package for device retest. It does not share data with the
+        // installed com.example.open_autoglm_android release and cannot replace it.
+        create("sidecar") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".screenshotdiag"
+            versionNameSuffix = "-screenshotdiag"
+            matchingFallbacks += listOf("debug")
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

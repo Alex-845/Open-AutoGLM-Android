@@ -33,6 +33,8 @@ data class ExecuteResult(
 
 class ActionExecutor(private val service: AutoGLMAccessibilityService) {
 
+    private val executedTaps = ArrayList<Pair<Int, Int>>()
+
     suspend fun execute(actionJson: String, screenWidth: Int, screenHeight: Int): ExecuteResult {
         return try {
             Log.d("ActionExecutor", "开始解析动作: ${actionJson.take(500)}")
@@ -268,14 +270,8 @@ class ActionExecutor(private val service: AutoGLMAccessibilityService) {
         return ""
     }
 
-    private fun convertRelativeToAbsolute(
-        element: List<Float>,
-        screenWidth: Int,
-        screenHeight: Int
-    ): Pair<Float, Float> {
-        val x = (element[0] / 1000f) * screenWidth
-        val y = (element[1] / 1000f) * screenHeight
-        return Pair(x, y)
+    private fun mapPoint(x: Float, y: Float, screenWidth: Int, screenHeight: Int): CoordinateSpace.Mapping {
+        return CoordinateSpace.mapToScreen(x, y, screenWidth, screenHeight)
     }
 
     private suspend fun executeAction(
@@ -355,19 +351,28 @@ class ActionExecutor(private val service: AutoGLMAccessibilityService) {
         if (element?.isJsonArray == true) {
             val array = element.asJsonArray
             if (array.size() >= 2) {
-                val (absoluteX, absoluteY) = convertRelativeToAbsolute(
-                    listOf(
-                        array[0].asFloat,
-                        array[1].asFloat
-                    ), screenWidth, screenHeight
-                )
-                service.tap(absoluteX, absoluteY)
-                delay(500)
-                return ExecuteResult(
-                    success = true,
-                    message = "已点击坐标: ($absoluteX, $absoluteY)",
-                    actionDetail = ActionDetail("tap", x1 = absoluteX, y1 = absoluteY)
-                )
+                val rawX = array[0].asFloat
+                val rawY = array[1].asFloat
+                when (val mapped = mapPoint(rawX, rawY, screenWidth, screenHeight)) {
+                    is CoordinateSpace.Mapping.OutOfRange -> {
+                        return ExecuteResult(false, CoordinateSpace.outOfRangeMessage(rawX, rawY))
+                    }
+                    is CoordinateSpace.Mapping.OnScreen -> {
+                        val normX = rawX.toInt()
+                        val normY = rawY.toInt()
+                        if (CoordinateSpace.isRepeatedTap(executedTaps, normX, normY)) {
+                            return ExecuteResult(false, CoordinateSpace.repeatMessage(normX, normY))
+                        }
+                        executedTaps.add(normX to normY)
+                        service.tap(mapped.point.x, mapped.point.y)
+                        delay(500)
+                        return ExecuteResult(
+                            success = true,
+                            message = "已点击坐标: (${mapped.point.x}, ${mapped.point.y})",
+                            actionDetail = ActionDetail("tap", x1 = mapped.point.x, y1 = mapped.point.y)
+                        )
+                    }
+                }
             }
             return ExecuteResult(success = false, message = "坐标格式错误")
         } else {
@@ -446,16 +451,20 @@ class ActionExecutor(private val service: AutoGLMAccessibilityService) {
             success = false,
             message = "Swipe 操作缺少 start 或 end 参数"
         )
-        val (startX, startY) = convertRelativeToAbsolute(
-            listOf(start[0].asFloat, start[1].asFloat),
-            screenWidth,
-            screenHeight
-        )
-        val (endX, endY) = convertRelativeToAbsolute(
-            listOf(end[0].asFloat, end[1].asFloat),
-            screenWidth,
-            screenHeight
-        )
+        val startPoint = mapPoint(start[0].asFloat, start[1].asFloat, screenWidth, screenHeight)
+        val endPoint = mapPoint(end[0].asFloat, end[1].asFloat, screenWidth, screenHeight)
+        if (startPoint is CoordinateSpace.Mapping.OutOfRange) {
+            return ExecuteResult(false, CoordinateSpace.outOfRangeMessage(start[0].asFloat, start[1].asFloat))
+        }
+        if (endPoint is CoordinateSpace.Mapping.OutOfRange) {
+            return ExecuteResult(false, CoordinateSpace.outOfRangeMessage(end[0].asFloat, end[1].asFloat))
+        }
+        val startOnScreen = (startPoint as CoordinateSpace.Mapping.OnScreen).point
+        val endOnScreen = (endPoint as CoordinateSpace.Mapping.OnScreen).point
+        val startX = startOnScreen.x
+        val startY = startOnScreen.y
+        val endX = endOnScreen.x
+        val endY = endOnScreen.y
         service.swipe(startX, startY, endX, endY)
         delay(500)
         return ExecuteResult(
@@ -487,17 +496,19 @@ class ActionExecutor(private val service: AutoGLMAccessibilityService) {
             success = false,
             message = "LongPress 操作缺少 element 参数"
         )
-        val (x, y) = convertRelativeToAbsolute(
-            listOf(element[0].asFloat, element[1].asFloat),
-            screenWidth,
-            screenHeight
-        )
-        service.longPress(x, y)
+        val rawX = element[0].asFloat
+        val rawY = element[1].asFloat
+        val mapped = mapPoint(rawX, rawY, screenWidth, screenHeight)
+        if (mapped is CoordinateSpace.Mapping.OutOfRange) {
+            return ExecuteResult(false, CoordinateSpace.outOfRangeMessage(rawX, rawY))
+        }
+        val point = (mapped as CoordinateSpace.Mapping.OnScreen).point
+        service.longPress(point.x, point.y)
         delay(800)
         return ExecuteResult(
             success = true,
-            message = "已长按坐标: ($x, $y)",
-            actionDetail = ActionDetail("longpress", x1 = x, y1 = y)
+            message = "已长按坐标: (${point.x}, ${point.y})",
+            actionDetail = ActionDetail("longpress", x1 = point.x, y1 = point.y)
         )
     }
 
@@ -511,19 +522,21 @@ class ActionExecutor(private val service: AutoGLMAccessibilityService) {
             success = false,
             message = "DoubleTap 操作缺少 element 参数"
         )
-        val (x, y) = convertRelativeToAbsolute(
-            listOf(element[0].asFloat, element[1].asFloat),
-            screenWidth,
-            screenHeight
-        )
-        service.tap(x, y)
+        val rawX = element[0].asFloat
+        val rawY = element[1].asFloat
+        val mapped = mapPoint(rawX, rawY, screenWidth, screenHeight)
+        if (mapped is CoordinateSpace.Mapping.OutOfRange) {
+            return ExecuteResult(false, CoordinateSpace.outOfRangeMessage(rawX, rawY))
+        }
+        val point = (mapped as CoordinateSpace.Mapping.OnScreen).point
+        service.tap(point.x, point.y)
         delay(100)
-        service.tap(x, y)
+        service.tap(point.x, point.y)
         delay(500)
         return ExecuteResult(
             success = true,
-            message = "已双击坐标: ($x, $y)",
-            actionDetail = ActionDetail("doubletap", x1 = x, y1 = y)
+            message = "已双击坐标: (${point.x}, ${point.y})",
+            actionDetail = ActionDetail("doubletap", x1 = point.x, y1 = point.y)
         )
     }
 

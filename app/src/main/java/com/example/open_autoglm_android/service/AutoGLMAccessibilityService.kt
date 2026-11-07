@@ -1,40 +1,75 @@
 package com.example.open_autoglm_android.service
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
+import android.content.Intent
+import android.view.accessibility.AccessibilityManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorSpace
 import android.graphics.Path
 import android.graphics.Rect
+import android.hardware.HardwareBuffer
+import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.Display
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.annotation.RequiresApi
 import com.example.open_autoglm_android.data.InputMode
 import com.example.open_autoglm_android.data.PreferencesRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
+
+data class ScreenCapture(
+    val bitmap: Bitmap?,
+    val failureMessage: String? = null
+)
 
 class AutoGLMAccessibilityService : AccessibilityService() {
     
     companion object {
+        private const val TAG = "AutoGLMScreenshot"
+        private const val SCREENSHOT_CALLBACK_TIMEOUT_MS = 4_000L
         private var instance: AutoGLMAccessibilityService? = null
         
         fun getInstance(): AutoGLMAccessibilityService? = instance
         
         fun isServiceEnabled(): Boolean = instance != null
+
+        suspend fun awaitConnectedInstance(
+            attempts: Int = 8,
+            pauseMs: Long = 250
+        ): AutoGLMAccessibilityService? {
+            repeat(attempts) { attempt ->
+                val current = instance
+                val connected = current?.serviceInfo != null
+                Log.i(TAG, "await connection attempt=$attempt instance=${current != null} serviceInfo=$connected")
+                if (current != null && connected) return current
+                delay(pauseMs)
+            }
+            return null
+        }
     }
     
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -70,9 +105,14 @@ class AutoGLMAccessibilityService : AccessibilityService() {
         }
     }
     
+    override fun onUnbind(intent: Intent?): Boolean {
+        if (instance === this) instance = null
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
+        if (instance === this) instance = null
         super.onDestroy()
-        instance = null
         mainHandler.removeCallbacksAndMessages(null)
     }
     
@@ -86,31 +126,392 @@ class AutoGLMAccessibilityService : AccessibilityService() {
     
     override fun onInterrupt() {}
     
-    fun takeScreenshot(callback: (Bitmap?) -> Unit) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            FloatingWindowService.getInstance()?.setVisibility(false)
-            mainExecutor.execute {
-                takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor, object : AccessibilityService.TakeScreenshotCallback {
-                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
-                        FloatingWindowService.getInstance()?.setVisibility(true)
-                        val hardwareBuffer = result.hardwareBuffer
-                        val hardwareBitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, null)
-                        hardwareBuffer?.close()
-                        val bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
-                        _latestScreenshot.value = bitmap
-                        callback(bitmap)
-                    }
-                    override fun onFailure(errorCode: Int) {
-                        FloatingWindowService.getInstance()?.setVisibility(true)
-                        callback(null)
-                    }
-                })
+    suspend fun takeScreenshotSuspend(): Bitmap? = captureForModel().bitmap
+
+    /**
+     * Captures the active display for the model.
+     * Waits until the task overlay is offscreen, uses that display's id, and copies the
+     * hardware buffer to a software bitmap before closing it.
+     */
+    suspend fun captureForModel(): ScreenCapture {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            return ScreenCapture(
+                bitmap = null,
+                failureMessage = ScreenshotCapturePlan.belowAndroid11Message(
+                    Build.VERSION.RELEASE,
+                    Build.VERSION.SDK_INT
+                )
+            )
+        }
+        val live = awaitConnectedInstance()
+        if (live == null) {
+            logScreenshotCapability()
+            return ScreenCapture(null, ScreenshotCapturePlan.connectionMissingMessage())
+        }
+        if (live !== this) return live.captureForModel()
+        val capability = readCapability()
+        Log.i(TAG, ScreenshotCapturePlan.formatCapabilityLog(capability))
+        when (ScreenshotCapturePlan.preCapture(capability)) {
+            ScreenshotCapturePlan.PreCapture.CAPABILITY_ABSENT -> {
+                return ScreenCapture(
+                    null,
+                    ScreenshotCapturePlan.screenshotCapabilityAbsentMessage(
+                        capability.enabledCapabilities ?: capability.inProcessCapabilities,
+                        ScreenshotCapturePlan.packageFilterBlocksAllApps(
+                            capability.enabledPackages ?: capability.inProcessPackages
+                        )
+                    )
+                )
             }
-        } else callback(null)
+            ScreenshotCapturePlan.PreCapture.WAIT_FOR_CONNECTION -> {
+                return ScreenCapture(null, ScreenshotCapturePlan.connectionMissingMessage())
+            }
+            ScreenshotCapturePlan.PreCapture.PROCEED -> Unit
+        }
+        val overlay = FloatingWindowService.getInstance()
+        var detached = false
+        try {
+            overlay?.hideForCapture(detachWindow = false)
+            var lastCode: Int? = null
+            var lastDetail: String? = null
+            for (attempt in 0 until ScreenshotCapturePlan.MAX_ATTEMPTS) {
+                if (!detached && attempt > 0 &&
+                    ScreenshotCapturePlan.shouldDetachOverlayOnRetry(lastCode)
+                ) {
+                    overlay?.hideForCapture(detachWindow = true)
+                    detached = true
+                }
+                val target = snapshotCaptureTarget()
+                val displayId = target?.displayId?.takeIf { it != ScreenshotCapturePlan.DISPLAY_INVALID }
+                    ?: Display.DEFAULT_DISPLAY
+                Log.i(
+                    TAG,
+                    "capture attempt=$attempt displayId=$displayId windowId=${target?.windowId} pkg=${target?.packageName}"
+                )
+                var shot = requestDisplayShot(displayId)
+                if (shot is Shot.Failed &&
+                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+                    target != null &&
+                    ScreenshotCapturePlan.shouldTryWindowFallback(shot.errorCode, target.windowId)
+                ) {
+                    val windowShot = requestWindowShot(target.windowId)
+                    shot = when (windowShot) {
+                        is Shot.Ok -> {
+                            val placed = placeWindowBitmapOnDisplay(windowShot.bitmap, target)
+                            if (placed != null) {
+                                Shot.Ok(placed)
+                            } else {
+                                if (!windowShot.bitmap.isRecycled) windowShot.bitmap.recycle()
+                                shot
+                            }
+                        }
+                        else -> shot
+                    }
+                }
+                when (shot) {
+                    is Shot.Ok -> {
+                        _latestScreenshot.value = shot.bitmap
+                        return ScreenCapture(shot.bitmap, null)
+                    }
+                    is Shot.Failed -> {
+                        lastCode = shot.errorCode
+                        lastDetail = shot.detail
+                        if (!ScreenshotCapturePlan.shouldRetryPlatform(shot.errorCode, attempt)) break
+                    }
+                    is Shot.DecodeFailed -> {
+                        lastCode = null
+                        lastDetail = shot.detail
+                        if (!ScreenshotCapturePlan.shouldRetryDecode(attempt)) break
+                    }
+                }
+                delay(ScreenshotCapturePlan.retryDelayMs(lastCode, attempt))
+            }
+            return ScreenCapture(
+                bitmap = null,
+                failureMessage = ScreenshotCapturePlan.userVisibleMessage(lastCode, lastDetail)
+            )
+        } finally {
+            overlay?.restoreAfterCapture()
+        }
     }
-    
-    suspend fun takeScreenshotSuspend(): Bitmap? = suspendCancellableCoroutine { continuation ->
-        takeScreenshot { continuation.resume(it) }
+
+    private fun logScreenshotCapability() {
+        try {
+            Log.i(TAG, ScreenshotCapturePlan.formatCapabilityLog(readCapability()))
+        } catch (t: RuntimeException) {
+            Log.w(TAG, "capability read failed ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    private fun readCapability(): ScreenshotCapturePlan.CapabilityRead {
+        val info = try {
+            serviceInfo
+        } catch (t: RuntimeException) {
+            Log.w(TAG, "getServiceInfo failed ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+        val enabled = readEnabledRecord()
+        return ScreenshotCapturePlan.CapabilityRead(
+            sdk = Build.VERSION.SDK_INT,
+            inProcessInfoPresent = info != null,
+            inProcessCapabilities = info?.capabilities,
+            inProcessFlags = info?.flags,
+            inProcessEventTypes = info?.eventTypes,
+            inProcessPackages = info?.packageNames?.toList(),
+            inProcessCanTakeScreenshot = info?.let { canTakeScreenshot(it.capabilities) },
+            enabledPresent = enabled != null,
+            enabledCapabilities = enabled?.capabilities,
+            enabledFlags = enabled?.flags,
+            enabledPackages = enabled?.packageNames?.toList(),
+            enabledCanTakeScreenshot = enabled?.let { canTakeScreenshot(it.capabilities) }
+        )
+    }
+
+    private fun readEnabledRecord(): AccessibilityServiceInfo? {
+        val manager = getSystemService(AccessibilityManager::class.java) ?: return null
+        val componentName = AutoGLMAccessibilityService::class.java.name
+        return manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .firstOrNull { info ->
+                val service = info.resolveInfo?.serviceInfo ?: return@firstOrNull false
+                service.packageName == packageName && service.name == componentName
+            }
+    }
+
+    private fun canTakeScreenshot(capabilities: Int): Boolean {
+        return (capabilities and AccessibilityServiceInfo.CAPABILITY_CAN_TAKE_SCREENSHOT) != 0
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun snapshotCaptureTarget(): ScreenshotCapturePlan.CaptureTarget? {
+        val list = try {
+            windows
+        } catch (t: RuntimeException) {
+            Log.w(TAG, "windows=error ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+        if (list == null) {
+            Log.w(TAG, "windows=null")
+            return null
+        }
+        Log.i(TAG, "windows=${list.size}")
+        val candidates = ArrayList<ScreenshotCapturePlan.WindowCandidate>(list.size)
+        try {
+            for (window in list) {
+                val bounds = Rect()
+                window.getBoundsInScreen(bounds)
+                val root = window.root
+                val pkg = root?.packageName?.toString()
+                root?.recycle()
+                candidates.add(
+                    ScreenshotCapturePlan.WindowCandidate(
+                        windowId = window.id,
+                        displayId = window.displayId,
+                        type = window.type,
+                        isActive = window.isActive,
+                        isFocused = window.isFocused,
+                        boundsLeft = bounds.left,
+                        boundsTop = bounds.top,
+                        boundsWidth = bounds.width(),
+                        boundsHeight = bounds.height(),
+                        packageName = pkg
+                    )
+                )
+            }
+        } finally {
+            list.forEach { it.recycle() }
+        }
+        return ScreenshotCapturePlan.selectCaptureTarget(candidates, packageName)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private suspend fun requestDisplayShot(displayId: Int): Shot {
+        return requestShot("display:$displayId") { resume ->
+            takeScreenshot(
+                displayId,
+                mainExecutor,
+                shotCallback(resume, "display:$displayId")
+            )
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    private suspend fun requestWindowShot(windowId: Int): Shot {
+        return requestShot("window:$windowId") { resume ->
+            takeScreenshotOfWindow(
+                windowId,
+                mainExecutor,
+                shotCallback(resume, "window:$windowId")
+            )
+        }
+    }
+
+    private suspend fun requestShot(source: String, invoke: (resume: (Shot) -> Unit) -> Unit): Shot {
+        return try {
+            withTimeout(SCREENSHOT_CALLBACK_TIMEOUT_MS) {
+                suspendCancellableCoroutine { continuation ->
+                    val resumed = AtomicBoolean(false)
+                    fun resume(shot: Shot) {
+                        if (!resumed.compareAndSet(false, true)) return
+                        if (!continuation.isActive) {
+                            if (shot is Shot.Ok && !shot.bitmap.isRecycled) shot.bitmap.recycle()
+                            return
+                        }
+                        continuation.resume(shot)
+                    }
+                    mainExecutor.execute {
+                        try {
+                            invoke(::resume)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "screenshot request threw for $source", t)
+                            val code = if (t is SecurityException) {
+                                ScreenshotCapturePlan.ERROR_NO_ACCESSIBILITY_ACCESS
+                            } else {
+                                ScreenshotCapturePlan.ERROR_INTERNAL
+                            }
+                            resume(Shot.Failed(code, t.javaClass.simpleName))
+                        }
+                    }
+                }
+            }
+        } catch (t: TimeoutCancellationException) {
+            Log.w(TAG, "screenshot callback timed out for $source")
+            Shot.Failed(ScreenshotCapturePlan.ERROR_INTERNAL, "timeout source=$source")
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun shotCallback(
+        resume: (Shot) -> Unit,
+        source: String
+    ): AccessibilityService.TakeScreenshotCallback {
+        return object : AccessibilityService.TakeScreenshotCallback {
+            override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                resume(decodeScreenshot(result, source))
+            }
+
+            override fun onFailure(errorCode: Int) {
+                Log.w(TAG, "screenshot failed source=$source code=$errorCode")
+                resume(Shot.Failed(errorCode, "source=$source"))
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun decodeScreenshot(
+        result: AccessibilityService.ScreenshotResult,
+        source: String
+    ): Shot {
+        val buffer = result.hardwareBuffer
+        var wrapped: Bitmap? = null
+        var software: Bitmap? = null
+        return try {
+            wrapped = wrapHardwareBuffer(buffer, result.colorSpace)
+            val hardware = wrapped
+            if (hardware == null) {
+                Shot.DecodeFailed("wrapHardwareBuffer=null format=${buffer.format} usage=${buffer.usage} source=$source")
+            } else {
+                software = copyToSoftwareBitmap(hardware)
+                if (software == null) {
+                    Shot.DecodeFailed(
+                        "softwareCopy=null format=${buffer.format} config=${hardware.config} ${hardware.width}x${hardware.height} source=$source"
+                    )
+                } else {
+                    Log.i(TAG, "decoded $source ${software.width}x${software.height} format=${buffer.format}")
+                    Shot.Ok(software)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "decode failed for $source", t)
+            Shot.DecodeFailed("${t.javaClass.simpleName} source=$source")
+        } finally {
+            if (wrapped != null && wrapped !== software && !wrapped.isRecycled) {
+                wrapped.recycle()
+            }
+            try {
+                buffer.close()
+            } catch (t: RuntimeException) {
+                Log.w(TAG, "hardwareBuffer.close failed: ${t.message}")
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun wrapHardwareBuffer(buffer: HardwareBuffer, colorSpace: ColorSpace?): Bitmap? {
+        val spaces = ArrayList<ColorSpace?>(2)
+        if (colorSpace is ColorSpace.Rgb) spaces.add(colorSpace)
+        spaces.add(null)
+        var lastError: IllegalArgumentException? = null
+        for (space in spaces) {
+            try {
+                val bitmap = Bitmap.wrapHardwareBuffer(buffer, space)
+                if (bitmap != null) return bitmap
+            } catch (e: IllegalArgumentException) {
+                lastError = e
+                Log.w(TAG, "wrapHardwareBuffer rejected colorSpace=$space: ${e.message}")
+            }
+        }
+        if (lastError != null) Log.w(TAG, "wrapHardwareBuffer failed", lastError)
+        return null
+    }
+
+    private fun copyToSoftwareBitmap(source: Bitmap): Bitmap? {
+        try {
+            val copied = source.copy(Bitmap.Config.ARGB_8888, false)
+            if (copied != null && copied !== source) return copied
+        } catch (t: Throwable) {
+            Log.w(TAG, "Bitmap.copy failed: ${t.message}")
+        }
+        return try {
+            val software = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
+            Canvas(software).drawBitmap(source, 0f, 0f, null)
+            software
+        } catch (t: Throwable) {
+            Log.w(TAG, "Canvas software copy failed: ${t.message}")
+            null
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun placeWindowBitmapOnDisplay(
+        bitmap: Bitmap,
+        target: ScreenshotCapturePlan.CaptureTarget
+    ): Bitmap? {
+        val display = displaySize(target.displayId) ?: return null
+        return when (
+            val placement = ScreenshotCapturePlan.placementForWindowBitmap(
+                boundsLeft = target.boundsLeft,
+                boundsTop = target.boundsTop,
+                bitmapWidth = bitmap.width,
+                bitmapHeight = bitmap.height,
+                displayWidth = display.width,
+                displayHeight = display.height
+            )
+        ) {
+            null -> null
+            ScreenshotCapturePlan.BitmapPlacement.UseAsIs -> bitmap
+            is ScreenshotCapturePlan.BitmapPlacement.Offset -> {
+                val full = Bitmap.createBitmap(display.width, display.height, Bitmap.Config.ARGB_8888)
+                Canvas(full).drawBitmap(bitmap, placement.left.toFloat(), placement.top.toFloat(), null)
+                if (!bitmap.isRecycled) bitmap.recycle()
+                full
+            }
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun displaySize(displayId: Int): ScreenshotCapturePlan.PixelSize? {
+        val displayManager = getSystemService(DisplayManager::class.java) ?: return null
+        val display = displayManager.getDisplay(displayId) ?: return null
+        val displayContext = createDisplayContext(display)
+        val windowManager = displayContext.getSystemService(WindowManager::class.java) ?: return null
+        val bounds = windowManager.maximumWindowMetrics.bounds
+        return ScreenshotCapturePlan.PixelSize(bounds.width(), bounds.height())
+    }
+
+    private sealed class Shot {
+        data class Ok(val bitmap: Bitmap) : Shot()
+        data class Failed(val errorCode: Int, val detail: String) : Shot()
+        data class DecodeFailed(val detail: String) : Shot()
     }
     
     fun getRootNode(): AccessibilityNodeInfo? = rootInActiveWindow

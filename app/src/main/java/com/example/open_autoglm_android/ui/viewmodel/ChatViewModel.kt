@@ -13,6 +13,7 @@ import com.example.open_autoglm_android.data.database.ModelConfigRepository
 import com.example.open_autoglm_android.data.database.SavedChatMessage
 import com.example.open_autoglm_android.domain.ActionExecutor
 import com.example.open_autoglm_android.domain.AppRegistry
+import com.example.open_autoglm_android.domain.CoordinateSpace
 import com.example.open_autoglm_android.domain.ExecuteResult
 import com.example.open_autoglm_android.network.ModelClient
 import com.example.open_autoglm_android.network.dto.ChatMessage as NetworkChatMessage
@@ -346,9 +347,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
     
     private suspend fun executeTaskLoop(userPrompt: String, modelName: String) {
-        val accessibilityService = AutoGLMAccessibilityService.getInstance() ?: return
+        var accessibilityService = AutoGLMAccessibilityService.getInstance() ?: return
         val client = modelClient ?: return
-        val executor = actionExecutor ?: return
+        var executor = actionExecutor ?: return
         
         var stepCount = 0
         val maxSteps = 50
@@ -369,6 +370,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             Log.d("ChatViewModel", "执行步骤 $stepCount")
+            val liveService = AutoGLMAccessibilityService.awaitConnectedInstance()
+            if (liveService == null) {
+                val message = com.example.open_autoglm_android.service.ScreenshotCapturePlan.connectionMissingMessage()
+                FloatingWindowService.getInstance()?.updateStatus("已停止", stepCount, message)
+                _uiState.value = _uiState.value.copy(isLoading = false, error = message)
+                return
+            }
+            if (liveService !== accessibilityService) {
+                accessibilityService = liveService
+                actionExecutor = ActionExecutor(liveService)
+                executor = actionExecutor ?: executor
+            }
             
             // 更新悬浮窗状态
             FloatingWindowService.getInstance()?.updateStatus("执行中", stepCount, "正在检测当前状态...")
@@ -390,21 +403,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             
             // 截图：如果当前在本应用前台，跳过截图发送以保护隐私
             val screenshotStartTime = System.currentTimeMillis()
-            val screenshot = if (isAutoGLMForeground) {
+            val captured = if (isAutoGLMForeground) {
                 Log.d("ChatViewModel", "当前在本应用前台，跳过截图以保护隐私")
                 null
             } else {
-                accessibilityService.takeScreenshotSuspend()
+                accessibilityService.captureForModel()
             }
+            val screenshot = captured?.bitmap
             val screenshotDuration = System.currentTimeMillis() - screenshotStartTime
             
             if (screenshot == null && !isAutoGLMForeground) {
-                val androidVersion = android.os.Build.VERSION.SDK_INT
-                val errorMessage = if (androidVersion < android.os.Build.VERSION_CODES.R) {
-                    "无法获取屏幕截图：需要 Android 11 (API 30) 及以上版本，当前版本: Android ${android.os.Build.VERSION.RELEASE} (API $androidVersion)"
-                } else {
-                    "无法获取屏幕截图，请确保无障碍服务已启用并授予截图权限。如果已启用，请尝试重启应用。"
-                }
+                val errorMessage = captured?.failureMessage
+                    ?: "无法获取屏幕截图，请重试任务。"
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
                     error = errorMessage
@@ -611,16 +621,24 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
                 // 如果是 JSON 解析/格式错误，给模型一条明确的反馈消息
                 val parseError = result.message?.contains("无法从响应中提取有效的 JSON 动作") == true
-                if (parseError) {
-                    val feedbackText = buildString {
-                        appendLine("上一步你的输出格式错误，无法解析为合法的动作指令。")
-                        appendLine("请严格按照系统提示中的格式，仅输出以下两种之一：")
-                        appendLine("1) do(action=\"...\", ...)")
-                        appendLine("2) finish(message=\"...\")")
-                        appendLine("不要输出列表、自然语言说明或其他非规范格式。")
-                        appendLine()
-                        append("你上一次的输出是：")
-                        append(response.action.take(200))
+                val coordinateFeedback = result.message?.let { message ->
+                    message.startsWith(CoordinateSpace.OUT_OF_RANGE_PREFIX) ||
+                        message.startsWith(CoordinateSpace.REPEAT_PREFIX)
+                } == true
+                if (parseError || coordinateFeedback) {
+                    val feedbackText = if (coordinateFeedback) {
+                        result.message ?: ""
+                    } else {
+                        buildString {
+                            appendLine("上一步你的输出格式错误，无法解析为合法的动作指令。")
+                            appendLine("请严格按照系统提示中的格式，仅输出以下两种之一：")
+                            appendLine("1) do(action=\"...\", ...)")
+                            appendLine("2) finish(message=\"...\")")
+                            appendLine("不要输出列表、自然语言说明或其他非规范格式。")
+                            appendLine()
+                            append("你上一次的输出是：")
+                            append(response.action.take(200))
+                        }
                     }
                     messageContext.add(
                         NetworkChatMessage(

@@ -6,8 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
+import android.util.Log
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.MotionEvent
@@ -16,13 +20,17 @@ import android.view.WindowManager
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlin.coroutines.resume
 import kotlin.math.abs
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 
 class FloatingWindowService : Service() {
 
     private var windowManager: WindowManager? = null
     private var floatingView: View? = null
     private var params: WindowManager.LayoutParams? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     
     // 状态
     private var currentStatus = "空闲"
@@ -36,6 +44,8 @@ class FloatingWindowService : Service() {
     private var initialTouchX = 0f
     private var initialTouchY = 0f
     
+    private var removedForCapture = false
+
     // 大小调整
     private var currentWidth = 280
     private var currentHeight = 160
@@ -279,6 +289,69 @@ class FloatingWindowService : Service() {
             floatingView?.visibility = if (visible) View.VISIBLE else View.GONE
         }
     }
+
+    /**
+     * Hides the task overlay and waits until a frame has been drawn without it.
+     * Setting GONE and capturing in the same turn leaves the overlay surface up;
+     * screen capture on API 36 can fail while that surface is changing.
+     * [detachWindow] removes the window entirely for a retry after that failure.
+     */
+    suspend fun hideForCapture(detachWindow: Boolean) {
+        if (floatingView == null) return
+        withTimeoutOrNull(CAPTURE_FRAME_TIMEOUT_MS) {
+            suspendCancellableCoroutine { continuation ->
+                mainHandler.post {
+                    val view = floatingView
+                    if (view != null) {
+                        if (detachWindow && !removedForCapture) {
+                            try {
+                                windowManager?.removeView(view)
+                                removedForCapture = true
+                            } catch (t: RuntimeException) {
+                                Log.w(TAG, "removeView for capture failed: ${t.message}")
+                                view.visibility = View.GONE
+                            }
+                        } else if (!removedForCapture) {
+                            view.visibility = View.GONE
+                        }
+                    }
+                    Choreographer.getInstance().postFrameCallback {
+                        if (continuation.isActive) continuation.resume(Unit)
+                    }
+                }
+            }
+        }
+    }
+
+    suspend fun restoreAfterCapture() {
+        if (floatingView == null && !removedForCapture) return
+        val restored = withTimeoutOrNull(CAPTURE_FRAME_TIMEOUT_MS) {
+            suspendCancellableCoroutine { continuation ->
+                mainHandler.post {
+                    floatingView?.let { restoreViewOnUi(it) }
+                    Choreographer.getInstance().postFrameCallback {
+                        if (continuation.isActive) continuation.resume(Unit)
+                    }
+                }
+            }
+        }
+        if (restored == null) {
+            mainHandler.post { floatingView?.let { restoreViewOnUi(it) } }
+        }
+    }
+
+    private fun restoreViewOnUi(view: View) {
+        if (removedForCapture) {
+            try {
+                windowManager?.addView(view, params)
+                removedForCapture = false
+            } catch (t: RuntimeException) {
+                Log.w(TAG, "addView after capture failed: ${t.message}")
+                return
+            }
+        }
+        view.visibility = View.VISIBLE
+    }
     
     private fun removeFloatingWindow() {
         floatingView?.let {
@@ -292,6 +365,8 @@ class FloatingWindowService : Service() {
     }
 
     companion object {
+        private const val TAG = "AutoGLMOverlay"
+        private const val CAPTURE_FRAME_TIMEOUT_MS = 500L
         private var instance: FloatingWindowService? = null
         var onStopClickListener: (() -> Unit)? = null
         var onPauseResumeClickListener: (() -> Unit)? = null
